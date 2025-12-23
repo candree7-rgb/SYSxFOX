@@ -123,7 +123,7 @@ class FoxSignalsTest:
                 event_name = payload.get('name', 'unknown')
 
                 # IGNORE these noisy events (only hide data, still log name)
-                ignored_events = ['prices_all', 'price', 'prices', 'ticker', 'tickers']
+                ignored_events = ['prices_all', 'price', 'prices', 'ticker', 'tickers', 'market_analysis']
                 if event_name in ignored_events:
                     return  # Skip price updates completely
 
