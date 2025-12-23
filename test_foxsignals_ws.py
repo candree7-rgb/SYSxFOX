@@ -122,17 +122,20 @@ class FoxSignalsTest:
             if isinstance(payload, dict):
                 event_name = payload.get('name', 'unknown')
 
-                # IGNORE these noisy events
+                # IGNORE these noisy events (only hide data, still log name)
                 ignored_events = ['prices_all', 'price', 'prices', 'ticker', 'tickers']
                 if event_name in ignored_events:
-                    return  # Skip price updates
+                    return  # Skip price updates completely
 
-                # Log interesting events
+                # Log ALL other events with full data
                 print(f"\n[{timestamp}] ← EVENT: {event_name}")
                 print("="*60)
                 data = payload.get('data', {})
                 print(json.dumps(data, indent=2, ensure_ascii=False))
                 print("="*60 + "\n")
+
+                # Also save to see all unique event names
+                print(f">>> NEW EVENT TYPE FOUND: {event_name} <<<")
             else:
                 print(f"\n[{timestamp}] ← EVENT: {payload}")
             return
