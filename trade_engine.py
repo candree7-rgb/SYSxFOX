@@ -1,0 +1,1075 @@
+"""
+Trade Engine for Telegram Signal Bot
+
+Features:
+- Dynamic SL based on HH/LL structure (clamped between 1.5% - 5%)
+- TP splits: 15/25/25/25 (90% total, 10% runner)
+- SL -> BE after TP1
+- Trailing after TP4
+"""
+
+import time
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+
+import sheets_export
+import telegram_alerts
+
+from config import (
+    CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT, MARGIN_MODE,
+    ENTRY_EXPIRATION_MIN, ENTRY_TOO_FAR_PCT, ENTRY_LIMIT_OFFSET_PCT,
+    TP_SPLITS, SL_PCT, SL_MAX_PCT, SL_MIN_PCT, SL_BUFFER_PCT,
+    SL_CANDLE_INTERVAL, SL_CANDLE_LOOKBACK,
+    MOVE_SL_TO_BE_ON_TP1,
+    TRAIL_AFTER_TP_INDEX, TRAIL_DISTANCE_PCT, TRAIL_ACTIVATE_ON_TP,
+    DRY_RUN
+)
+
+
+def _opposite_side(side: str) -> str:
+    return "Sell" if side == "Buy" else "Buy"
+
+
+def _pos_side(side: str) -> str:
+    return "Long" if side == "Buy" else "Short"
+
+
+class TradeEngine:
+    def __init__(self, bybit, state: dict, logger):
+        self.bybit = bybit
+        self.state = state
+        self.log = logger
+        self._instrument_cache: Dict[str, Dict[str, float]] = {}
+        self._cache_ttl = 300  # 5 min cache
+        self._cache_times: Dict[str, float] = {}
+        self._last_stats_day: str = ""
+
+    # ---------- startup sync ----------
+    def startup_sync(self) -> None:
+        """Check for orphaned positions at startup."""
+        if DRY_RUN:
+            self.log.info("DRY_RUN: Skipping startup sync")
+            return
+
+        try:
+            positions = self.bybit.positions(CATEGORY, "")
+            open_positions = [p for p in positions if float(p.get("size") or 0) > 0]
+
+            if not open_positions:
+                self.log.info("Startup sync: No open positions found")
+                return
+
+            tracked_symbols = set()
+            for tr in self.state.get("open_trades", {}).values():
+                if tr.get("status") in ("pending", "open"):
+                    tracked_symbols.add(tr.get("symbol"))
+
+            orphaned = []
+            for pos in open_positions:
+                symbol = pos.get("symbol")
+                size = float(pos.get("size") or 0)
+                side = pos.get("side")
+                entry = float(pos.get("avgPrice") or 0)
+                pnl = float(pos.get("unrealisedPnl") or 0)
+
+                if symbol not in tracked_symbols:
+                    orphaned.append(f"{symbol} ({side} {size} @ {entry}, PnL: {pnl:.2f})")
+
+            if orphaned:
+                self.log.warning(f"Orphaned positions (not tracked):")
+                for o in orphaned:
+                    self.log.warning(f"   {o}")
+            else:
+                self.log.info(f"Startup sync: {len(open_positions)} position(s), all tracked")
+
+            if self.state.get("trade_history"):
+                self.log_performance_report()
+
+        except Exception as e:
+            self.log.warning(f"Startup sync failed: {e}")
+
+    def log_daily_stats(self) -> None:
+        """Log daily statistics once per day."""
+        from state import utc_day_key
+        today = utc_day_key()
+
+        if self._last_stats_day == today:
+            return
+
+        if self._last_stats_day:
+            daily_count = self.state.get("daily_counts", {}).get(self._last_stats_day, 0)
+            if daily_count > 0:
+                self.log.info(f"Stats for {self._last_stats_day}: {daily_count} trades placed")
+                self.log_performance_report()
+
+        self._last_stats_day = today
+
+    # ---------- precision helpers ----------
+    @staticmethod
+    def _floor_to_step(x: float, step: float) -> float:
+        if step <= 0:
+            return x
+        return math.floor(x / step) * step
+
+    def _get_instrument_rules(self, symbol: str) -> Dict[str, float]:
+        """Get instrument rules with caching."""
+        now = time.time()
+        cached_time = self._cache_times.get(symbol, 0)
+
+        if symbol in self._instrument_cache and (now - cached_time) < self._cache_ttl:
+            return self._instrument_cache[symbol]
+
+        info = self.bybit.instruments_info(CATEGORY, symbol)
+        lot = info.get("lotSizeFilter") or {}
+        price_filter = info.get("priceFilter") or {}
+        qty_step = float(lot.get("qtyStep") or lot.get("basePrecision") or "0.000001")
+        min_qty = float(lot.get("minOrderQty") or "0")
+        tick_size = float(price_filter.get("tickSize") or "0.0001")
+
+        rules = {"qty_step": qty_step, "min_qty": min_qty, "tick_size": tick_size}
+        self._instrument_cache[symbol] = rules
+        self._cache_times[symbol] = now
+        return rules
+
+    def _round_price(self, price: float, tick_size: float) -> float:
+        if tick_size <= 0:
+            return price
+        return round(round(price / tick_size) * tick_size, 10)
+
+    def _round_qty(self, qty: float, qty_step: float, min_qty: float) -> float:
+        qty = self._floor_to_step(qty, qty_step)
+        if qty < min_qty:
+            qty = min_qty
+        return float(f"{qty:.10f}")
+
+    # ---------- dynamic SL based on structure ----------
+    def _find_swing_point(self, symbol: str, side: str, entry_price: float) -> Optional[float]:
+        """Find the nearest swing low (for long) or swing high (for short).
+
+        Uses 1h candles and looks for local min/max.
+        Returns the SL price (with buffer) or None if detection fails.
+        """
+        try:
+            candles = self.bybit.klines(
+                CATEGORY, symbol,
+                interval=SL_CANDLE_INTERVAL,
+                limit=SL_CANDLE_LOOKBACK
+            )
+
+            if len(candles) < 5:
+                self.log.warning(f"Not enough candles for {symbol}, using fallback SL")
+                return None
+
+            if side == "Buy":  # LONG: Find swing LOW
+                # Find the lowest low in recent candles
+                lows = [c["low"] for c in candles]
+                swing_low = min(lows)
+
+                # Add buffer below the swing low
+                sl_price = swing_low * (1 - SL_BUFFER_PCT / 100.0)
+
+                # Calculate distance from entry
+                distance_pct = (entry_price - sl_price) / entry_price * 100
+
+            else:  # SHORT (Sell): Find swing HIGH
+                # Find the highest high in recent candles
+                highs = [c["high"] for c in candles]
+                swing_high = max(highs)
+
+                # Add buffer above the swing high
+                sl_price = swing_high * (1 + SL_BUFFER_PCT / 100.0)
+
+                # Calculate distance from entry
+                distance_pct = (sl_price - entry_price) / entry_price * 100
+
+            # Clamp between min and max
+            if distance_pct < SL_MIN_PCT:
+                # Structure too close, use minimum
+                if side == "Buy":
+                    sl_price = entry_price * (1 - SL_MIN_PCT / 100.0)
+                else:
+                    sl_price = entry_price * (1 + SL_MIN_PCT / 100.0)
+                self.log.info(f"SL clamped to MIN {SL_MIN_PCT}% (structure was {distance_pct:.1f}%)")
+
+            elif distance_pct > SL_MAX_PCT:
+                # Structure too far, use maximum
+                if side == "Buy":
+                    sl_price = entry_price * (1 - SL_MAX_PCT / 100.0)
+                else:
+                    sl_price = entry_price * (1 + SL_MAX_PCT / 100.0)
+                self.log.info(f"SL clamped to MAX {SL_MAX_PCT}% (structure was {distance_pct:.1f}%)")
+
+            else:
+                self.log.info(f"SL at structure: {distance_pct:.1f}% from entry")
+
+            return sl_price
+
+        except Exception as e:
+            self.log.warning(f"Swing detection failed for {symbol}: {e}")
+            return None
+
+    def calc_base_qty(self, symbol: str, entry_price: float) -> float:
+        """Calculate position size based on risk percentage."""
+        equity = self.bybit.wallet_equity(ACCOUNT_TYPE)
+        margin = equity * (RISK_PCT / 100.0)
+        notional = margin * LEVERAGE
+        qty = notional / entry_price
+
+        rules = self._get_instrument_rules(symbol)
+        final_qty = self._round_qty(qty, rules["qty_step"], rules["min_qty"])
+
+        # Log position sizing details
+        self.log.info(f"Position sizing: equity=${equity:.2f}, margin=${margin:.2f}, "
+                      f"notional=${notional:.2f}, qty={final_qty} {symbol.replace('USDT', '')}")
+
+        return final_qty
+
+    # ---------- entry gatekeepers ----------
+    def _too_far(self, side: str, last: float, trigger: float) -> bool:
+        """Check if price already moved too far past entry."""
+        if side == "Sell":
+            return last <= trigger * (1 - ENTRY_TOO_FAR_PCT / 100.0)
+        return last >= trigger * (1 + ENTRY_TOO_FAR_PCT / 100.0)
+
+    # ---------- position helpers ----------
+    def _position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        plist = self.bybit.positions(CATEGORY, symbol)
+        for p in plist:
+            if p.get("symbol") == symbol:
+                return p
+        return None
+
+    def position_size_avg(self, symbol: str) -> tuple[float, float]:
+        p = self._position(symbol)
+        if not p:
+            return 0.0, 0.0
+        size = float(p.get("size") or 0)
+        avg = float(p.get("avgPrice") or 0)
+        return size, avg
+
+    # ---------- core actions ----------
+    def place_entry_order(self, sig: Dict[str, Any], trade_id: str) -> Optional[str]:
+        """
+        Place a limit entry order.
+        Entry is placed 0.1% BETTER than signal price (more likely to fill).
+        """
+        symbol = sig["symbol"]
+        side = "Sell" if sig["side"] == "sell" else "Buy"
+        entry_price = float(sig["trigger"])
+
+        # Set leverage and margin mode
+        try:
+            if not DRY_RUN:
+                self.bybit.set_leverage(CATEGORY, symbol, LEVERAGE)
+                # Set margin mode (ISOLATED)
+                if MARGIN_MODE == "ISOLATED":
+                    self.bybit.set_margin_mode(CATEGORY, symbol, 1)  # 1 = Isolated
+        except Exception as e:
+            # Ignore "not modified" errors
+            if "not modified" not in str(e).lower():
+                self.log.warning(f"set_leverage/margin failed for {symbol}: {e}")
+
+        last = self.bybit.last_price(CATEGORY, symbol)
+        if self._too_far(side, last, entry_price):
+            self.log.info(f"SKIP {symbol} - price too far (last={last}, entry={entry_price})")
+            return None
+
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+
+        # Calculate limit price: 0.1% BETTER than signal entry
+        offset = ENTRY_LIMIT_OFFSET_PCT / 100.0
+        if side == "Buy":  # LONG: buy slightly lower
+            limit_price = entry_price * (1 - offset)
+        else:  # SHORT: sell slightly higher
+            limit_price = entry_price * (1 + offset)
+
+        limit_price = self._round_price(limit_price, tick_size)
+        qty = self.calc_base_qty(symbol, entry_price)
+
+        body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": f"{qty:.10f}",
+            "price": f"{limit_price:.10f}",
+            "timeInForce": "GTC",
+            "reduceOnly": False,
+            "closeOnTrigger": False,
+            "orderLinkId": trade_id,
+        }
+
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN ENTRY {symbol}: {body}")
+            return "DRY_RUN"
+
+        try:
+            self.log.debug(f"Bybit place_order: {body}")
+            resp = self.bybit.place_order(body)
+            self.log.debug(f"Bybit response: {resp}")
+            oid = (resp.get("result") or {}).get("orderId")
+            if oid:
+                self.log.info(f"Entry order created: {symbol} orderId={oid}")
+            else:
+                self.log.warning(f"No orderId in response: {resp}")
+            return oid
+        except Exception as e:
+            self.log.error(f"Entry order FAILED for {symbol}: {e}")
+            return None
+
+    def cancel_entry(self, symbol: str, order_id: str) -> None:
+        body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN cancel entry: {body}")
+            return
+        self.bybit.cancel_order(body)
+
+    def place_post_entry_orders(self, trade: Dict[str, Any]) -> None:
+        """
+        Place SL + TP orders after entry is filled.
+
+        - SL: 5% from entry (fixed)
+        - TPs: Use signal's TP prices with our splits (15/25/25/25)
+        - Remaining 10% = runner for trailing stop after TP4
+        """
+        symbol = trade["symbol"]
+        side = trade["order_side"]  # Buy/Sell
+        entry = float(trade["entry_price"])
+
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+        qty_step = rules["qty_step"]
+        min_qty = rules["min_qty"]
+
+        # Get position size
+        size, _avg = self.position_size_avg(symbol)
+        if size <= 0:
+            self.log.warning(f"No position size yet for {symbol}; will retry")
+            return
+
+        # Calculate dynamic SL based on structure (HH/LL)
+        sl_price = self._find_swing_point(symbol, side, entry)
+
+        if sl_price is None:
+            # Fallback to fixed SL if structure detection fails
+            sl_pct = SL_PCT / 100.0
+            if side == "Sell":  # SHORT: SL above entry
+                sl_price = entry * (1 + sl_pct)
+            else:  # LONG: SL below entry
+                sl_price = entry * (1 - sl_pct)
+            self.log.info(f"Using fallback SL at {SL_PCT}%: {sl_price}")
+
+        sl_price = self._round_price(sl_price, tick_size)
+
+        # Calculate and log the actual SL distance
+        if side == "Sell":
+            sl_distance_pct = (sl_price - entry) / entry * 100
+        else:
+            sl_distance_pct = (entry - sl_price) / entry * 100
+        self.log.info(f"Final SL: {sl_price} ({sl_distance_pct:.2f}% from entry)")
+
+        # Store SL info in trade for analytics
+        trade["sl_price"] = sl_price
+        trade["sl_distance_pct"] = round(sl_distance_pct, 2)
+
+        # Get TP prices from signal
+        tp_prices: List[float] = trade.get("tp_prices") or []
+
+        if not tp_prices:
+            self.log.warning(f"No TP prices for {symbol} - using fallback TPs")
+            # Fallback: Generate TPs at 1%, 2%, 3%, 4% from entry
+            for pct in [1.0, 2.0, 3.0, 4.0]:
+                if side == "Sell":  # SHORT: TPs below entry
+                    tp = entry * (1 - pct / 100.0)
+                else:  # LONG: TPs above entry
+                    tp = entry * (1 + pct / 100.0)
+                tp_prices.append(self._round_price(tp, tick_size))
+            trade["tp_prices"] = tp_prices
+
+        # Build TP orders - handle minimum quantity requirements
+        tp_orders = []
+        tp_to_place = min(len(tp_prices), len(TP_SPLITS))
+        splits_sum = sum(TP_SPLITS[:tp_to_place])
+        runner_pct = 100 - splits_sum
+
+        self.log.info(f"Placing {tp_to_place} TPs (splits: {TP_SPLITS[:tp_to_place]}, {runner_pct:.0f}% runner)")
+
+        # Calculate total qty for TPs (excluding runner)
+        tp_total_pct = splits_sum
+        remaining_qty = self._floor_to_step(size * (tp_total_pct / 100.0), qty_step)
+
+        # Check if position is too small for splits
+        if remaining_qty < min_qty:
+            # Position too small for TP splits - place single TP at last TP price
+            self.log.warning(f"Position too small for TP splits ({size} < {min_qty * 4}). Placing single TP.")
+            if tp_prices:
+                last_tp = self._round_price(float(tp_prices[-1]), tick_size)
+                tp_qty = self._floor_to_step(size * 0.9, qty_step)  # 90%, keep 10% runner
+                if tp_qty >= min_qty:
+                    tp_orders.append({
+                        "idx": 0,
+                        "body": {
+                            "category": CATEGORY,
+                            "symbol": symbol,
+                            "side": _opposite_side(side),
+                            "orderType": "Limit",
+                            "qty": f"{tp_qty}",
+                            "price": f"{last_tp:.10f}",
+                            "timeInForce": "GTC",
+                            "reduceOnly": True,
+                            "closeOnTrigger": False,
+                            "orderLinkId": f"{trade['id']}:TP1",
+                        }
+                    })
+                else:
+                    self.log.warning(f"Position too small for ANY TP order ({tp_qty} < {min_qty}). Only SL set.")
+        else:
+            # Normal flow: place individual TPs
+            accumulated_pct = 0.0
+            for idx in range(tp_to_place):
+                pct = float(TP_SPLITS[idx])
+                if pct <= 0:
+                    continue
+
+                tp = self._round_price(float(tp_prices[idx]), tick_size)
+                raw_qty = size * (pct / 100.0)
+                qty = self._floor_to_step(raw_qty, qty_step)
+
+                # Skip if quantity would be below minimum
+                if qty < min_qty:
+                    self.log.debug(f"Skipping TP{idx+1}: qty {qty} < min_qty {min_qty}")
+                    accumulated_pct += pct
+                    continue
+
+                # If we accumulated skipped TPs, add them to this one
+                if accumulated_pct > 0:
+                    extra_qty = self._floor_to_step(size * (accumulated_pct / 100.0), qty_step)
+                    qty = self._floor_to_step(qty + extra_qty, qty_step)
+                    accumulated_pct = 0.0
+
+                tp_orders.append({
+                    "idx": idx,
+                    "body": {
+                        "category": CATEGORY,
+                        "symbol": symbol,
+                        "side": _opposite_side(side),
+                        "orderType": "Limit",
+                        "qty": f"{qty}",
+                        "price": f"{tp:.10f}",
+                        "timeInForce": "GTC",
+                        "reduceOnly": True,
+                        "closeOnTrigger": False,
+                        "orderLinkId": f"{trade['id']}:TP{idx+1}",
+                    }
+                })
+
+        self.log.info(f"Created {len(tp_orders)} TP order(s)")
+
+        # Set SL on position
+        ts_body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "positionIdx": 0,
+            "stopLoss": f"{sl_price:.10f}",
+            "tpslMode": "Full",
+        }
+
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN set SL: {ts_body}")
+            for o in tp_orders:
+                self.log.info(f"DRY_RUN TP{o['idx']+1}: {o['body']}")
+                trade.setdefault("tp_order_ids", {})[str(o['idx']+1)] = f"DRY_TP{o['idx']+1}"
+                if o['idx'] == 0:
+                    trade["tp1_order_id"] = "DRY_TP1"
+        else:
+            # Place SL + TPs in parallel
+            def place_order(order_tuple):
+                order_type, o = order_tuple
+                resp = self.bybit.place_order(o["body"])
+                return order_type, o["idx"], (resp.get("result") or {}).get("orderId")
+
+            def set_sl():
+                self.bybit.set_trading_stop(ts_body)
+                return "SL", 0, None
+
+            all_orders = [("TP", o) for o in tp_orders]
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                sl_future = executor.submit(set_sl)
+                order_futures = [executor.submit(place_order, o) for o in all_orders]
+
+                try:
+                    sl_future.result()
+                    self.log.info(f"SL set successfully")
+                except Exception as e:
+                    self.log.warning(f"SL setting failed: {e}")
+
+                for future in as_completed(order_futures):
+                    try:
+                        order_type, idx, oid = future.result()
+                        if order_type == "TP":
+                            trade.setdefault("tp_order_ids", {})[str(idx+1)] = oid
+                            if idx == 0:
+                                trade["tp1_order_id"] = oid
+                    except Exception as e:
+                        self.log.warning(f"Order placement failed: {e}")
+
+        trade["post_orders_placed"] = True
+
+    # ---------- reactive events ----------
+    def on_execution(self, ev: Dict[str, Any]) -> None:
+        """Handle execution events from WebSocket."""
+        link = ev.get("orderLinkId") or ev.get("orderLinkID") or ""
+        if not link:
+            return
+
+        # Entry filled?
+        if link in self.state.get("open_trades", {}):
+            tr = self.state["open_trades"][link]
+            if tr.get("status") == "pending":
+                exec_price = ev.get("execPrice") or ev.get("price") or ev.get("lastPrice") or tr.get("trigger")
+                try:
+                    tr["entry_price"] = float(exec_price)
+                except Exception:
+                    pass
+                tr["status"] = "open"
+                tr["filled_ts"] = time.time()
+                tr.setdefault("tp_fills", 0)
+                tr.setdefault("tp_fills_list", [])
+                self.log.info(f"ENTRY FILLED {tr['symbol']} @ {tr.get('entry_price')}")
+
+                telegram_alerts.send_trade_opened(
+                    symbol=tr["symbol"],
+                    side=tr["order_side"],
+                    entry=tr.get("entry_price", 0),
+                    qty=tr.get("base_qty", 0),
+                )
+
+                try:
+                    self.place_post_entry_orders(tr)
+                except Exception as e:
+                    self.log.warning(f"Post-entry orders failed (will retry): {e}")
+            return
+
+        # TP fills
+        if ":TP" in link:
+            trade_id, tp_tag = link.split(":", 1)
+            tr = self.state.get("open_trades", {}).get(trade_id)
+            if not tr:
+                return
+
+            import re as _re
+            m = _re.search(r"TP(\d+)", tp_tag)
+            if not m:
+                return
+
+            tp_num = int(m.group(1))
+
+            # Track TP fill
+            filled_tps = tr.get("tp_fills_list", [])
+            if tp_num not in filled_tps:
+                filled_tps.append(tp_num)
+                tr["tp_fills_list"] = filled_tps
+                tr["tp_fills"] = len(filled_tps)
+                tp_count = len(tr.get("tp_prices") or [])
+                self.log.info(f"TP{tp_num} HIT {tr['symbol']} ({tr['tp_fills']}/{tp_count})")
+
+            # TP1 -> SL to BE
+            if MOVE_SL_TO_BE_ON_TP1 and tp_num == 1 and not tr.get("sl_moved_to_be"):
+                be = float(tr.get("entry_price") or tr.get("trigger"))
+                self._move_sl(tr["symbol"], be)
+                tr["sl_moved_to_be"] = True
+                self.log.info(f"SL -> BE {tr['symbol']} @ {be}")
+
+            # Start trailing after TP4 (or configured TP)
+            if TRAIL_ACTIVATE_ON_TP and tp_num == TRAIL_AFTER_TP_INDEX and not tr.get("trailing_started"):
+                self._start_trailing(tr, tp_num)
+                tr["trailing_started"] = True
+                self.log.info(f"TRAILING STARTED {tr['symbol']} after TP{tp_num}")
+
+    def _move_sl(self, symbol: str, sl_price: float, max_retries: int = 3) -> bool:
+        """Move SL with retry logic."""
+        rules = self._get_instrument_rules(symbol)
+        sl_price = self._round_price(sl_price, rules["tick_size"])
+        body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "positionIdx": 0,
+            "stopLoss": f"{sl_price:.10f}",
+            "tpslMode": "Full",
+        }
+
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN move SL: {body}")
+            return True
+
+        for attempt in range(max_retries):
+            try:
+                self.bybit.set_trading_stop(body)
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.log.warning(f"SL move attempt {attempt+1} failed: {e}")
+                    time.sleep(0.1)
+                else:
+                    self.log.error(f"SL move FAILED after {max_retries} attempts: {e}")
+                    return False
+        return False
+
+    def _start_trailing(self, tr: Dict[str, Any], tp_num: int) -> None:
+        """Start trailing stop after TPn is hit."""
+        symbol = tr["symbol"]
+        side = tr["order_side"]
+        tp_prices = tr.get("tp_prices") or []
+
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+
+        current_price = self.bybit.last_price(CATEGORY, symbol)
+
+        if len(tp_prices) < tp_num:
+            anchor = current_price
+        else:
+            anchor = float(tp_prices[tp_num - 1])
+
+        anchor = self._round_price(anchor, tick_size)
+        dist = self._round_price(anchor * (TRAIL_DISTANCE_PCT / 100.0), tick_size)
+
+        body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "positionIdx": 0,
+            "tpslMode": "Full",
+            "trailingStop": f"{dist:.10f}",
+        }
+
+        # Set active price only if not yet reached
+        if side == "Sell":  # SHORT
+            if anchor < current_price:
+                body["activePrice"] = f"{anchor:.10f}"
+        else:  # LONG
+            if anchor > current_price:
+                body["activePrice"] = f"{anchor:.10f}"
+
+        # Keep SL at BE if already moved
+        if tr.get("sl_moved_to_be"):
+            be_price = float(tr.get("entry_price") or tr.get("trigger"))
+            be_price = self._round_price(be_price, tick_size)
+            body["stopLoss"] = f"{be_price:.10f}"
+
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN set trailing: {body}")
+            return
+
+        try:
+            self.bybit.set_trading_stop(body)
+            self.log.info(f"Trailing started for {symbol} (dist: {dist})")
+        except Exception as e:
+            self.log.warning(f"Failed to set trailing for {symbol}: {e}")
+
+    # ---------- maintenance ----------
+    def check_tp_fills_fallback(self) -> None:
+        """Polling fallback for TP1 fills."""
+        if DRY_RUN:
+            return
+
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") != "open":
+                continue
+            if not tr.get("post_orders_placed"):
+                continue
+            if tr.get("sl_moved_to_be"):
+                continue
+
+            symbol = tr["symbol"]
+            side = tr["order_side"]
+            tp_prices = tr.get("tp_prices") or []
+
+            if not tp_prices:
+                continue
+
+            tp1_price = float(tp_prices[0])
+            should_move_to_be = False
+
+            # Check if TP1 order filled
+            tp1_oid = tr.get("tp1_order_id")
+            if tp1_oid:
+                try:
+                    open_orders = self.bybit.open_orders(CATEGORY, symbol)
+                    tp1_still_open = any(o.get("orderId") == tp1_oid for o in open_orders)
+                    if not tp1_still_open:
+                        should_move_to_be = True
+                except Exception:
+                    pass
+
+            # Check if price passed TP1
+            if not should_move_to_be:
+                try:
+                    current_price = self.bybit.last_price(CATEGORY, symbol)
+                    if side == "Buy" and current_price >= tp1_price:
+                        should_move_to_be = True
+                        self.log.info(f"Price passed TP1 for {symbol}")
+                    elif side == "Sell" and current_price <= tp1_price:
+                        should_move_to_be = True
+                        self.log.info(f"Price passed TP1 for {symbol}")
+                except Exception:
+                    pass
+
+            if should_move_to_be:
+                be = float(tr.get("entry_price") or tr.get("trigger"))
+                if self._move_sl(symbol, be):
+                    tr["sl_moved_to_be"] = True
+                    if 1 not in tr.get("tp_fills_list", []):
+                        tr.setdefault("tp_fills_list", []).append(1)
+                        tr["tp_fills"] = len(tr["tp_fills_list"])
+                    self.log.info(f"SL -> BE (fallback) {symbol} @ {be}")
+
+    def cancel_expired_entries(self) -> None:
+        """Cancel entries that haven't filled within timeout."""
+        now = time.time()
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") != "pending":
+                continue
+            placed = float(tr.get("placed_ts") or 0)
+            if placed and now - placed > ENTRY_EXPIRATION_MIN * 60:
+                oid = tr.get("entry_order_id")
+                if oid and oid != "DRY_RUN":
+                    try:
+                        self.cancel_entry(tr["symbol"], oid)
+                        self.log.info(f"Canceled expired entry {tr['symbol']} ({tid})")
+                    except Exception as e:
+                        self.log.warning(f"Cancel failed {tr['symbol']}: {e}")
+                tr["status"] = "expired"
+
+    def check_position_alerts(self) -> None:
+        """Check positions and send Telegram alerts if thresholds crossed."""
+        if not telegram_alerts.is_enabled():
+            return
+
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") != "open":
+                continue
+
+            symbol = tr["symbol"]
+            side = tr["order_side"]
+            avg_entry = float(tr.get("entry_price") or 0)
+
+            if not avg_entry:
+                continue
+
+            try:
+                current_price = self.bybit.last_price(CATEGORY, symbol)
+                if not current_price:
+                    continue
+
+                telegram_alerts.check_position_alerts(
+                    trade_id=tid,
+                    symbol=symbol,
+                    side=side,
+                    avg_entry=avg_entry,
+                    current_price=current_price,
+                    leverage=LEVERAGE,
+                    dca_fills=0,  # No DCA in this version
+                    dca_count=0,
+                )
+            except Exception as e:
+                self.log.debug(f"Position alert check failed for {symbol}: {e}")
+
+    def cleanup_closed_trades(self) -> None:
+        """Remove trades from state if position is closed."""
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") not in ("open",):
+                continue
+            try:
+                size, _ = self.position_size_avg(tr["symbol"])
+                if size == 0:
+                    self._cancel_all_trade_orders(tr)
+                    tr["status"] = "closed"
+                    tr["closed_ts"] = time.time()
+                    self._fetch_and_store_trade_stats(tr)
+
+                    if sheets_export.is_enabled():
+                        self._export_trade_to_sheets(tr)
+
+                    telegram_alerts.send_trade_closed(
+                        symbol=tr["symbol"],
+                        side=tr["order_side"],
+                        pnl=tr.get("realized_pnl", 0),
+                        exit_reason=tr.get("exit_reason", "unknown"),
+                        tp_fills=tr.get("tp_fills", 0),
+                        dca_fills=0,
+                    )
+                    telegram_alerts.clear_alerts_for_trade(tid)
+                    self.log.info(f"TRADE CLOSED {tr['symbol']} ({tid})")
+            except Exception as e:
+                self.log.warning(f"Cleanup check failed for {tr['symbol']}: {e}")
+
+        # Prune old closed/expired trades
+        cutoff = time.time() - 86400
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") in ("closed", "expired"):
+                closed_at = tr.get("closed_ts") or tr.get("placed_ts") or 0
+                if closed_at < cutoff:
+                    self._archive_trade(tr)
+                    del self.state["open_trades"][tid]
+
+    def _cancel_all_trade_orders(self, trade: Dict[str, Any]) -> None:
+        """Cancel all pending orders for a closed trade."""
+        if DRY_RUN:
+            return
+
+        symbol = trade["symbol"]
+        trade_id = trade["id"]
+
+        try:
+            open_orders = self.bybit.open_orders(CATEGORY, symbol)
+            cancelled = 0
+
+            for order in open_orders:
+                link_id = order.get("orderLinkId") or ""
+                if link_id.startswith(trade_id + ":"):
+                    order_id = order.get("orderId")
+                    if order_id:
+                        try:
+                            self.bybit.cancel_order({
+                                "category": CATEGORY,
+                                "symbol": symbol,
+                                "orderId": order_id
+                            })
+                            cancelled += 1
+                        except Exception:
+                            pass
+
+            if cancelled > 0:
+                self.log.info(f"Cleaned up {cancelled} pending order(s) for {symbol}")
+
+        except Exception as e:
+            self.log.warning(f"Failed to cleanup orders for {symbol}: {e}")
+
+    def _export_trade_to_sheets(self, trade: Dict[str, Any]) -> None:
+        """Export trade to Google Sheets."""
+        try:
+            entry_price = trade.get("entry_price") or trade.get("trigger") or 0
+            base_qty = trade.get("base_qty") or 0
+            margin_used = (entry_price * base_qty) / LEVERAGE if entry_price and base_qty else 0
+
+            equity_at_close = 0
+            try:
+                equity_at_close = self.bybit.wallet_equity(ACCOUNT_TYPE)
+            except Exception:
+                pass
+
+            tp_count = len(trade.get("tp_prices") or [])
+
+            export_data = {
+                "id": trade.get("id"),
+                "symbol": trade.get("symbol"),
+                "side": trade.get("pos_side"),
+                "entry_price": entry_price,
+                "trigger": trade.get("trigger"),
+                "placed_ts": trade.get("placed_ts"),
+                "filled_ts": trade.get("filled_ts"),
+                "closed_ts": trade.get("closed_ts"),
+                "realized_pnl": trade.get("realized_pnl"),
+                "margin_used": margin_used,
+                "equity_at_close": equity_at_close,
+                "is_win": trade.get("is_win"),
+                "exit_reason": trade.get("exit_reason"),
+                "tp_fills": trade.get("tp_fills", 0),
+                "tp_count": tp_count,
+                "dca_fills": 0,
+                "dca_count": 0,
+                "trailing_used": trade.get("trailing_started", False),
+            }
+
+            if sheets_export.export_trade(export_data):
+                self.log.info(f"Trade exported to Google Sheets")
+        except Exception as e:
+            self.log.warning(f"Google Sheets export error: {e}")
+
+    def _fetch_and_store_trade_stats(self, trade: Dict[str, Any]) -> None:
+        """Fetch final PnL from Bybit."""
+        if DRY_RUN:
+            trade["realized_pnl"] = 0.0
+            trade["exit_reason"] = "dry_run"
+            return
+
+        symbol = trade["symbol"]
+        filled_ts = trade.get("filled_ts") or trade.get("placed_ts") or 0
+
+        try:
+            start_time = int((filled_ts - 60) * 1000) if filled_ts else None
+            pnl_records = self.bybit.closed_pnl(CATEGORY, symbol, start_time=start_time, limit=20)
+
+            total_pnl = 0.0
+            for rec in pnl_records:
+                rec_time = int(rec.get("createdTime") or 0)
+                if rec_time >= int(filled_ts * 1000):
+                    total_pnl += float(rec.get("closedPnl") or 0)
+
+            trade["realized_pnl"] = total_pnl
+            trade["is_win"] = total_pnl > 0
+            trade["exit_reason"] = self._determine_exit_reason(trade)
+            self._log_trade_summary(trade)
+
+        except Exception as e:
+            self.log.warning(f"Failed to fetch PnL for {symbol}: {e}")
+            trade["realized_pnl"] = None
+            trade["exit_reason"] = "unknown"
+
+    def _determine_exit_reason(self, trade: Dict[str, Any]) -> str:
+        """Determine how the trade was closed."""
+        tp_fills = trade.get("tp_fills", 0)
+        tp_count = len(trade.get("tp_prices") or [])
+        trailing_started = trade.get("trailing_started", False)
+        sl_moved_to_be = trade.get("sl_moved_to_be", False)
+        pnl = trade.get("realized_pnl", 0)
+
+        if trailing_started and pnl and pnl > 0:
+            return "trailing_stop"
+        elif tp_fills >= tp_count:
+            return "all_tps_hit"
+        elif tp_fills > 0 and sl_moved_to_be and pnl is not None and abs(pnl) < 1:
+            return "breakeven"
+        elif tp_fills > 0:
+            return f"tp{tp_fills}_then_sl"
+        elif pnl and pnl < 0:
+            return "stop_loss"
+        else:
+            return "unknown"
+
+    def _log_trade_summary(self, trade: Dict[str, Any]) -> None:
+        """Log a trade summary."""
+        symbol = trade["symbol"]
+        side = trade.get("pos_side", "")
+        entry = trade.get("entry_price", trade.get("trigger"))
+        pnl = trade.get("realized_pnl", 0) or 0
+        exit_reason = trade.get("exit_reason", "unknown")
+        tp_fills = trade.get("tp_fills", 0)
+        tp_count = len(trade.get("tp_prices") or [])
+        is_win = pnl > 0
+
+        emoji = "WIN" if is_win else "LOSS"
+
+        self.log.info("")
+        self.log.info("=" * 50)
+        self.log.info(f"TRADE {emoji}: {symbol} {side}")
+        self.log.info("=" * 50)
+        self.log.info(f"   Entry: ${entry:.6f}")
+        self.log.info(f"   PnL: ${pnl:.2f} USDT")
+        self.log.info(f"   TPs Hit: {tp_fills}/{tp_count}")
+        self.log.info(f"   Exit: {exit_reason}")
+        self.log.info("=" * 50)
+        self.log.info("")
+
+    def _archive_trade(self, trade: Dict[str, Any]) -> None:
+        """Archive trade to history."""
+        history = self.state.setdefault("trade_history", [])
+
+        archived = {
+            "id": trade.get("id"),
+            "symbol": trade.get("symbol"),
+            "side": trade.get("pos_side"),
+            "entry_price": trade.get("entry_price"),
+            "trigger": trade.get("trigger"),
+            "placed_ts": trade.get("placed_ts"),
+            "filled_ts": trade.get("filled_ts"),
+            "closed_ts": trade.get("closed_ts"),
+            "realized_pnl": trade.get("realized_pnl"),
+            "is_win": trade.get("is_win"),
+            "exit_reason": trade.get("exit_reason"),
+            "tp_fills": trade.get("tp_fills", 0),
+            "tp_count": len(trade.get("tp_prices") or []),
+            "dca_fills": 0,
+            "dca_count": 0,
+            "trailing_used": trade.get("trailing_started", False),
+        }
+        history.append(archived)
+
+        if len(history) > 500:
+            self.state["trade_history"] = history[-500:]
+
+    def get_trade_stats(self, days: Optional[int] = None) -> Dict[str, Any]:
+        """Calculate trade statistics."""
+        history = self.state.get("trade_history", [])
+        now = time.time()
+
+        if days:
+            cutoff = now - (days * 86400)
+            trades = [t for t in history if (t.get("closed_ts") or 0) >= cutoff]
+        else:
+            trades = history
+
+        if not trades:
+            return {
+                "period_days": days or "all",
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "total_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "best_trade": 0.0,
+                "worst_trade": 0.0,
+                "avg_tp_fills": 0.0,
+                "trailing_exits": 0,
+                "sl_exits": 0,
+                "be_exits": 0,
+            }
+
+        wins = [t for t in trades if t.get("is_win")]
+        pnls = [t.get("realized_pnl") or 0 for t in trades]
+        tp_fills = [t.get("tp_fills") or 0 for t in trades]
+
+        exit_reasons = [t.get("exit_reason") or "" for t in trades]
+        trailing_exits = sum(1 for r in exit_reasons if r == "trailing_stop")
+        sl_exits = sum(1 for r in exit_reasons if r == "stop_loss")
+        be_exits = sum(1 for r in exit_reasons if r == "breakeven")
+
+        return {
+            "period_days": days or "all",
+            "total_trades": len(trades),
+            "wins": len(wins),
+            "losses": len(trades) - len(wins),
+            "win_rate": round(len(wins) / len(trades) * 100, 1) if trades else 0.0,
+            "total_pnl": round(sum(pnls), 2),
+            "avg_pnl": round(sum(pnls) / len(trades), 2) if trades else 0.0,
+            "best_trade": round(max(pnls), 2) if pnls else 0.0,
+            "worst_trade": round(min(pnls), 2) if pnls else 0.0,
+            "avg_tp_fills": round(sum(tp_fills) / len(trades), 1) if trades else 0.0,
+            "trailing_exits": trailing_exits,
+            "sl_exits": sl_exits,
+            "be_exits": be_exits,
+        }
+
+    def log_performance_report(self) -> None:
+        """Log performance report."""
+        stats_7d = self.get_trade_stats(7)
+        stats_30d = self.get_trade_stats(30)
+        stats_all = self.get_trade_stats()
+
+        self.log.info("")
+        self.log.info("=" * 60)
+        self.log.info("PERFORMANCE REPORT")
+        self.log.info("=" * 60)
+
+        for label, stats in [("7 Days", stats_7d), ("30 Days", stats_30d), ("All Time", stats_all)]:
+            if stats["total_trades"] == 0:
+                self.log.info(f"\n{label}: No trades")
+                continue
+
+            self.log.info(f"\n{label}:")
+            self.log.info(f"   Trades: {stats['total_trades']} | Wins: {stats['wins']} | Losses: {stats['losses']}")
+            self.log.info(f"   Win Rate: {stats['win_rate']}%")
+            self.log.info(f"   Total PnL: ${stats['total_pnl']:.2f} | Avg: ${stats['avg_pnl']:.2f}")
+            self.log.info(f"   Best: ${stats['best_trade']:.2f} | Worst: ${stats['worst_trade']:.2f}")
+            self.log.info(f"   Avg TPs Hit: {stats['avg_tp_fills']:.1f}")
+            self.log.info(f"   Exits: {stats['trailing_exits']} trailing, {stats['sl_exits']} SL, {stats['be_exits']} BE")
+
+        self.log.info("")
+        self.log.info("=" * 60)
+
+        if sheets_export.is_enabled():
+            sheets_export.export_stats_summary(stats_7d, stats_30d, stats_all)

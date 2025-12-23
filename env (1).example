@@ -1,0 +1,94 @@
+# =============================================================================
+# TELEGRAM SIGNAL SOURCE
+# =============================================================================
+# Get credentials from: https://my.telegram.org/apps
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=your_api_hash_here
+TELEGRAM_CHANNEL=@channel_username_or_id
+TELEGRAM_SESSION_STRING=your_session_string_from_generate_session.py
+# TELEGRAM_PHONE=+491234567890  # Only needed for first-time auth
+
+# =============================================================================
+# BYBIT API
+# =============================================================================
+BYBIT_API_KEY=your_api_key
+BYBIT_API_SECRET=your_api_secret
+BYBIT_TESTNET=false
+BYBIT_DEMO=false
+ACCOUNT_TYPE=UNIFIED
+
+# =============================================================================
+# TRADING PARAMETERS
+# =============================================================================
+CATEGORY=linear
+QUOTE=USDT
+
+# Fixed leverage (ignores signal's leverage!)
+LEVERAGE=10
+
+# Position size: % of equity as margin per trade
+RISK_PCT=3.0
+
+# Margin mode: ISOLATED (ignores signal's Cross mode!)
+MARGIN_MODE=ISOLATED
+
+# =============================================================================
+# STOP LOSS (5% fixed, provider doesn't give SL)
+# =============================================================================
+SL_PCT=5.0
+MOVE_SL_TO_BE_ON_TP1=true
+
+# =============================================================================
+# TAKE PROFIT SPLITS
+# =============================================================================
+# TP1: 15%, TP2: 25%, TP3: 25%, TP4: 25% = 90% total
+# Remaining 10% = Runner for trailing stop
+TP_SPLITS=15,25,25,25
+
+# =============================================================================
+# TRAILING STOP
+# =============================================================================
+# Start trailing after TP4 (index 4)
+TRAIL_AFTER_TP_INDEX=4
+# Trail distance: 1.5%
+TRAIL_DISTANCE_PCT=1.5
+TRAIL_ACTIVATE_ON_TP=true
+
+# =============================================================================
+# ENTRY RULES
+# =============================================================================
+# Entry timeout in minutes (5-10 min recommended)
+ENTRY_EXPIRATION_MIN=7
+
+# Place limit order 0.1% better than signal entry
+ENTRY_LIMIT_OFFSET_PCT=0.1
+
+# Skip if price already moved too far past entry
+ENTRY_TOO_FAR_PCT=0.5
+
+# =============================================================================
+# LIMITS & SAFETY
+# =============================================================================
+MAX_CONCURRENT_TRADES=3
+MAX_TRADES_PER_DAY=20
+TC_MAX_LAG_SEC=300
+
+# =============================================================================
+# POLLING
+# =============================================================================
+POLL_SECONDS=10
+POLL_JITTER_MAX=3
+
+# =============================================================================
+# MISC
+# =============================================================================
+DRY_RUN=true
+STATE_FILE=state.json
+LOG_LEVEL=INFO
+
+# =============================================================================
+# TELEGRAM ALERTS (optional - for trade notifications)
+# =============================================================================
+# TELEGRAM_ALERT_BOT_TOKEN=your_bot_token
+# TELEGRAM_ALERT_CHAT_ID=your_chat_id
+# POSITION_ALERT_THRESHOLDS=25,35,50
