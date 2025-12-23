@@ -2,23 +2,28 @@
 FoxSignals WebSocket Test Script
 
 Verbindet sich mit dem FoxSignals WebSocket und loggt alle Nachrichten.
-Läuft lokal - zeigt dir das exakte Format der Signale.
+Zeigt das exakte Format der Signale.
 
-Usage:
+Usage (lokal):
+    export FOXSIGNALS_JWT="your_token_here"
+    export FOXSIGNALS_USER_ID="your_user_id"
     python test_foxsignals_ws.py
+
+Usage (Railway):
+    Set ENV vars: FOXSIGNALS_JWT, FOXSIGNALS_USER_ID
+    Change start command to: python test_foxsignals_ws.py
 """
 
+import os
 import json
 import time
-import threading
 from websocket import WebSocketApp
 
 # =============================================================================
-# CONFIGURATION - Paste your JWT token here
+# CONFIGURATION - From ENV variables
 # =============================================================================
-JWT_TOKEN = "eyJhbGciOiJSUzI1NiIsImtpZCI6Ijk4OGQ1YTM3OWI3OGJkZjFlNTBhNDA5MTEzZjJiMGM3NWU0NTJlNDciLCJ0eXAiOiJKV1QifQ.eyJuYW1lIjoiQW5kcsOpIENhcnZhIiwicGljdHVyZSI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0pPVldlOHhZU1JzSjBWTjByY25OVnN4MXM0c0NRX1F0YTVaZnkxWEd4cW1kaWNsRzNvPXM5Ni1jIiwiaXNzIjoiaHR0cHM6Ly9zZWN1cmV0b2tlbi5nb29nbGUuY29tL2ZveC1zaWduYWxzIiwiYXVkIjoiZm94LXNpZ25hbHMiLCJhdXRoX3RpbWUiOjE3NTY0NTM1NDcsInVzZXJfaWQiOiJWanlNakJxRzVkVU1mUDZOQWFyVkNqbFVkZVAyIiwic3ViIjoiVmp5TWpCcUc1ZFVNZlA2TkFhclZDamxVZGVQMiIsImlhdCI6MTc2NjQ3MTIyMiwiZXhwIjoxNzY2NDc0ODIyLCJlbWFpbCI6ImMuYW5kcmVlN0BnbWFpbC5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiZmlyZWJhc2UiOnsiaWRlbnRpdGllcyI6eyJnb29nbGUuY29tIjpbIjEwNzg2NDQ0NTIxNzI0NTM0MzcyMCJdLCJlbWFpbCI6WyJjLmFuZHJlZTdAZ21haWwuY29tIl19LCJzaWduX2luX3Byb3ZpZGllciI6Imdvb2dsZS5jb20ifX0.IlyZxL8-sQ8Psl9J3Gteb9G9TjdWXoHZqFZtpu6GlTzlFU7Ep4zE55jpcgrOk-Qy9VgyK5Zwiz52_b6Jj14W4a-o-3ES1XhH17aXdHk8QqCouCK0b6ikPgu-slZUNbW2LRxycJHR5U8PGA7Mf4O4J4guCby5FFYtbj21Ea7EOCulYrBGYGeKYgYJbCBjkeuIgi_xBo77zOlSPsjV8YBALnc7HViajufLJibU1El0G0MJIgda6i2Owph4K-pd0Wsal6toTAR3E3smEi_7nfK40YEyHVVIgxdzGTsfbJyqjWndwPTeJuw82OlLlG9DSirQBdD640s1zhv_IUxvG08ACA"
-
-USER_ID = "VjyMjBqG5dUMfP6NAarVCjlUdeP2"
+JWT_TOKEN = os.getenv("FOXSIGNALS_JWT", "")
+USER_ID = os.getenv("FOXSIGNALS_USER_ID", "")
 
 WS_URL = "wss://serverapi.getfoxsignals.com/socketio/socket.io/?EIO=4&transport=websocket"
 
@@ -173,6 +178,16 @@ class FoxSignalsTest:
 
 
 if __name__ == "__main__":
+    # Validate ENV vars
+    if not JWT_TOKEN:
+        print("ERROR: FOXSIGNALS_JWT env variable not set!")
+        print("Get it from HTTP Toolkit -> jsonwebtoken header")
+        exit(1)
+    if not USER_ID:
+        print("ERROR: FOXSIGNALS_USER_ID env variable not set!")
+        print("Get it from HTTP Toolkit -> userid header")
+        exit(1)
+
     try:
         test = FoxSignalsTest()
         test.run()
