@@ -99,9 +99,8 @@ class FoxSignalsTest:
         timestamp = time.strftime("%H:%M:%S")
 
         if msg_type == "ping":
-            # Respond to ping with pong
+            # Respond to ping with pong (silently)
             ws.send("3")
-            print(f"[{timestamp}] ← PING → PONG")
             return
 
         if msg_type == "pong":
@@ -120,19 +119,25 @@ class FoxSignalsTest:
             return
 
         if msg_type == "event":
-            print(f"\n[{timestamp}] ← EVENT #{self.message_count}")
-            print("-"*50)
             if isinstance(payload, dict):
-                print(f"  Event Name: {payload.get('name', 'unknown')}")
-                print(f"  Data:")
+                event_name = payload.get('name', 'unknown')
+
+                # IGNORE these noisy events (only hide data, still log name)
+                ignored_events = ['prices_all', 'price', 'prices', 'ticker', 'tickers']
+                if event_name in ignored_events:
+                    return  # Skip price updates completely
+
+                # Log ALL other events with full data
+                print(f"\n[{timestamp}] ← EVENT: {event_name}")
+                print("="*60)
                 data = payload.get('data', {})
-                if isinstance(data, dict):
-                    print(json.dumps(data, indent=4, ensure_ascii=False))
-                else:
-                    print(f"    {data}")
+                print(json.dumps(data, indent=2, ensure_ascii=False))
+                print("="*60 + "\n")
+
+                # Also save to see all unique event names
+                print(f">>> NEW EVENT TYPE FOUND: {event_name} <<<")
             else:
-                print(f"  Raw: {payload}")
-            print("-"*50 + "\n")
+                print(f"\n[{timestamp}] ← EVENT: {payload}")
             return
 
         # Unknown message type
