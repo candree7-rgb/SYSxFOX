@@ -112,6 +112,18 @@ class FoxSignalsTest:
             auth_msg = f'40{{"jsonwebtoken":"{JWT_TOKEN}","userid":"{USER_ID}"}}'
             ws.send(auth_msg)
             print(f"[{timestamp}] → AUTH sent")
+
+            # Try subscribing to signals channel
+            time.sleep(1)
+            subscribe_msgs = [
+                '42["subscribe","signals"]',
+                '42["subscribe",{"channel":"signals"}]',
+                '42["join","signals"]',
+                '42["subscribe","crypto_signals"]',
+            ]
+            for msg in subscribe_msgs:
+                ws.send(msg)
+                print(f"[{timestamp}] → SUBSCRIBE: {msg}")
             return
 
         if msg_type == "connect":
